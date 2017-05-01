@@ -10,12 +10,13 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"reflect"
 
 	"github.com/magiconair/convert/apply"
 )
 
 func main() {
+	//printAST("src.go", src)
+	//return
 	write := flag.Bool("w", false, "write changes to file")
 	flag.Parse()
 
@@ -37,23 +38,47 @@ func main() {
 	}
 }
 
-func transformFile(fname string, src interface{}) ([]byte, error) {
+var src = `
+package foo
+
+func f() {
+		if err := f(); err != nil {
+			t.Log(err)
+			continue
+		}
+		break
+	}
+`
+
+func printAST(fname string, src interface{}) {
+	// parse input
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, fname, src, parser.ParseComments)
+	root, err := parser.ParseFile(fset, fname, src, parser.ParseComments)
+	if err != nil {
+		panic(err)
+	}
+	ast.Print(fset, root)
+}
+
+func transformFile(fname string, src interface{}) ([]byte, error) {
+	// parse input
+	fset := token.NewFileSet()
+	root, err := parser.ParseFile(fset, fname, src, parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
-	transform(f)
+	// ast.Print(fset, root)
+
+	// apply transformation
+	// todo(fs): we probably need to fix the imports
+	apply.Apply(root, rewrite, nil)
+
+	// format transformed code
 	var b bytes.Buffer
-	if err := format.Node(&b, fset, f); err != nil {
+	if err := format.Node(&b, fset, root); err != nil {
 		return nil, err
 	}
 	return b.Bytes(), nil
-}
-
-func transform(root ast.Node) {
-	apply.Apply(root, rewrite, nil)
-	// we probably need to fix the imports
 }
 
 // rewrite recursively rewrites the if statements
@@ -63,24 +88,81 @@ func transform(root ast.Node) {
 func rewrite(c apply.ApplyCursor) bool {
 	switch c.Node().(type) {
 	case *ast.IfStmt:
-		if body := isWaitForResult(c.Node()); body != nil {
-			stmt := makeForRetry(rewriteBody(body))
-			c.Replace(stmt)
+		arg := isWaitForResult(c.Node())
+		if arg == nil {
+			return true
 		}
+
+		var body *ast.BlockStmt
+		switch x := arg.(type) {
+		case *ast.Ident:
+			body = makeSimpleBody(x)
+		case *ast.BlockStmt:
+			body = rewriteBody(x)
+		default:
+			return true
+		}
+		c.Replace(makeForRetry(body))
 	}
 	return true
 }
 
+func makeSimpleBody(s *ast.Ident) *ast.BlockStmt {
+	return &ast.BlockStmt{
+		List: []ast.Stmt{
+			&ast.IfStmt{
+				Init: &ast.AssignStmt{
+					Lhs: []ast.Expr{
+						&ast.Ident{Name: "err"},
+					},
+					Tok: token.DEFINE,
+					Rhs: []ast.Expr{
+						&ast.CallExpr{Fun: s},
+					},
+				},
+				Cond: &ast.BinaryExpr{
+					X:  &ast.Ident{Name: "err"},
+					Op: token.NEQ,
+					Y:  &ast.Ident{Name: "nil"},
+				},
+				Body: &ast.BlockStmt{
+					List: []ast.Stmt{
+						&ast.ExprStmt{
+							&ast.CallExpr{
+								Fun: &ast.SelectorExpr{
+									X:   &ast.Ident{Name: "t"},
+									Sel: &ast.Ident{Name: "Log"},
+								},
+								Args: []ast.Expr{
+									&ast.Ident{Name: "err"},
+								},
+							},
+						},
+						&ast.BranchStmt{Tok: token.CONTINUE},
+					},
+				},
+			},
+			&ast.BranchStmt{Tok: token.BREAK},
+		},
+	}
+}
+
 // isWaitForResult checks if the node is an if statement
 // of the form and returns the body of the callback function.
+// or the name of the test function.
 //
 //   if err := testutil.WaitForResult(func() (bool, error) {
 //       // callback body
 //   }); err != nil {
 //       t.Fatal(err)
 //   }
-
-func isWaitForResult(n ast.Node) *ast.BlockStmt {
+//
+// or
+//
+//   if err := testutil.WaitForResult(x); err != nil {
+//       t.Fatal(err)
+//   }
+func isWaitForResult(n ast.Node) ast.Node {
 	// if stmt?
 	x, ok := n.(*ast.IfStmt)
 	if !ok || x.Init == nil || x.Body == nil {
@@ -96,8 +178,7 @@ func isWaitForResult(n ast.Node) *ast.BlockStmt {
 	}
 
 	// if err := ?
-	var err error
-	if a.Lhs[0].(*ast.Ident).Obj.Type != reflect.TypeOf(err) {
+	if a.Lhs[0].(*ast.Ident).Name != "err" {
 		// log.Print("no error")
 		return nil
 	}
@@ -111,18 +192,21 @@ func isWaitForResult(n ast.Node) *ast.BlockStmt {
 
 	// if err := testutil.WaitForResult(...) ?
 	f, ok := c.Fun.(*ast.SelectorExpr)
+	// ast.Print(token.NewFileSet(), f)
 	if !ok || f.X.(*ast.Ident).Name != "testutil" || f.Sel.Name != "WaitForResult" {
 		// log.Print("wrong name")
 		return nil
 	}
 
-	// return function body
-	ff, ok := c.Args[0].(*ast.FuncLit)
-	if !ok {
-		// log.Print("no func lit")
-		return nil
+	switch ff := c.Args[0].(type) {
+	case *ast.Ident:
+		return ff
+	case *ast.FuncLit:
+		return ff.Body
+	default:
+		log.Fatal("invalid WaitForResult arg type: %T", ff)
 	}
-	return ff.Body
+	return nil
 }
 
 // makeForRetry creates a for loop with a retryer

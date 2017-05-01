@@ -64,6 +64,25 @@ func TestRewriteBody(t *testing.T) {
 			}
 			`,
 		},
+		{
+			"wfr with local fn",
+			`
+			g := func() (bool, error) { return true, nil }
+			if err := testutil.WaitForResult(g); err != nil {
+				t.Fatal(err)
+			}
+			`,
+			`
+			g := func() (bool, error) { return true, nil }
+			for r := retry.OneSec(); r.NextOr(t.FailNow); {
+				if err := g(); err != nil {
+					t.Log(err)
+					continue
+				}
+				break
+			}
+			`,
+		},
 	}
 
 	clean := func(s string) string {
