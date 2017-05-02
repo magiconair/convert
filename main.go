@@ -1,3 +1,26 @@
+// wfr2retry rewrites calls from WaitForResult to use the retry package.
+//
+// It transforms from
+//
+//   if err := testutil.WaitForResult(func() (bool, error) {
+//       if err := foo(); err != nil {
+//           return false, fmt.Errorf("foo: %s", err)
+//       }
+//       return true, nil
+//   }); err != nil {
+//       t.Fatal(err)
+//   }
+//
+// to
+//
+//   for r := retry.OneSec(); r.NextOr(t.FailNow); {
+//       if err := foo(); err != nil {
+//           t.Logf("foo: %s", err)
+//           continue
+//       }
+//       break
+//   }
+//
 package main
 
 import (
@@ -11,7 +34,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/magiconair/convert/apply"
+	"github.com/magiconair/wfr2retry/apply"
 )
 
 func main() {

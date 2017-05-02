@@ -1,4 +1,4 @@
-Tool for converting.
+Tool for converting
 
 ```go
 if err := testutil.WaitForResult(func() (bool, error) {
@@ -25,7 +25,7 @@ for r := retry.OneSec(); r.Next(t.FailNow); {
 ### Usage
 
 ```
-convert [-w] file.go ...
+wfr2retry [-w] file.go ...
 ```
 
 Uses `apply` package from https://gist.github.com/josharian/78760cea426d7f104c7c55f0b3c037d1
