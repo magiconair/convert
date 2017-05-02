@@ -37,10 +37,11 @@ import (
 	"github.com/magiconair/wfr2retry/apply"
 )
 
+var write, printAST bool
+
 func main() {
-	//printAST("src.go", src)
-	//return
-	write := flag.Bool("w", false, "write changes to file")
+	flag.BoolVar(&write, "w", false, "write changes to file")
+	flag.BoolVar(&printAST, "ast", false, "print ast and exit")
 	flag.Parse()
 
 	log.SetFlags(0)
@@ -51,7 +52,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if *write {
+		if write {
 			if err := ioutil.WriteFile(fname, data, 0644); err != nil {
 				log.Fatal(err)
 			}
@@ -61,28 +62,6 @@ func main() {
 	}
 }
 
-var src = `
-package foo
-
-func f() {
-		if err := f(); err != nil {
-			t.Log(err)
-			continue
-		}
-		break
-	}
-`
-
-func printAST(fname string, src interface{}) {
-	// parse input
-	fset := token.NewFileSet()
-	root, err := parser.ParseFile(fset, fname, src, parser.ParseComments)
-	if err != nil {
-		panic(err)
-	}
-	ast.Print(fset, root)
-}
-
 func transformFile(fname string, src interface{}) ([]byte, error) {
 	// parse input
 	fset := token.NewFileSet()
@@ -90,10 +69,15 @@ func transformFile(fname string, src interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// ast.Print(fset, root)
+
+	// not pretty ... :(
+	if printAST {
+		ast.Print(fset, root)
+		os.Exit(0)
+	}
 
 	// apply transformation
-	// todo(fs): we probably need to fix the imports
+	// todo(fs): we probably need to fix the imports or run goimports afterwards
 	apply.Apply(root, rewrite, nil)
 
 	// format transformed code
@@ -111,12 +95,8 @@ func transformFile(fname string, src interface{}) ([]byte, error) {
 func rewrite(c apply.ApplyCursor) bool {
 	switch c.Node().(type) {
 	case *ast.IfStmt:
-		arg := isWaitForResult(c.Node())
-		if arg == nil {
-			return true
-		}
-
 		var body *ast.BlockStmt
+		arg := wfrBody(c.Node())
 		switch x := arg.(type) {
 		case *ast.Ident:
 			body = makeSimpleBody(x)
@@ -170,66 +150,43 @@ func makeSimpleBody(s *ast.Ident) *ast.BlockStmt {
 	}
 }
 
-// isWaitForResult checks if the node is an if statement
+// wfrBody checks if the node is an if statement
 // of the form and returns the body of the callback function.
 // or the name of the test function.
-//
-//   if err := testutil.WaitForResult(func() (bool, error) {
-//       // callback body
-//   }); err != nil {
-//       t.Fatal(err)
-//   }
-//
-// or
-//
-//   if err := testutil.WaitForResult(x); err != nil {
-//       t.Fatal(err)
-//   }
-func isWaitForResult(n ast.Node) ast.Node {
-	// if stmt?
-	x, ok := n.(*ast.IfStmt)
-	if !ok || x.Init == nil || x.Body == nil {
-		// log.Print("not if")
-		return nil
-	}
+func wfrBody(n ast.Node) ast.Node {
+	// if init; cond { body } ?
+	if ifn, ok := n.(*ast.IfStmt); ok && ifn.Init != nil && ifn.Body != nil {
 
-	// if x := y; ... ?
-	a, ok := x.Init.(*ast.AssignStmt)
-	if !ok || len(a.Lhs) != 1 || len(a.Rhs) != 1 {
-		// log.Print("wrong args")
-		return nil
-	}
+		// if a := b ; ... ?
+		if a, ok := ifn.Init.(*ast.AssignStmt); ok && len(a.Lhs) == 1 && len(a.Rhs) == 1 {
 
-	// if err := ?
-	if a.Lhs[0].(*ast.Ident).Name != "err" {
-		// log.Print("no error")
-		return nil
-	}
+			// if err := ?
+			if a.Lhs[0].(*ast.Ident).Name == "err" {
 
-	// if err := f(x) ?
-	c, ok := a.Rhs[0].(*ast.CallExpr)
-	if !ok || len(c.Args) != 1 {
-		// log.Print("no call")
-		return nil
-	}
+				// if err := f(a);
+				if c, ok := a.Rhs[0].(*ast.CallExpr); ok && len(c.Args) == 1 {
 
-	// if err := testutil.WaitForResult(...) ?
-	f, ok := c.Fun.(*ast.SelectorExpr)
-	// ast.Print(token.NewFileSet(), f)
-	if !ok || f.X.(*ast.Ident).Name != "testutil" || f.Sel.Name != "WaitForResult" {
-		// log.Print("wrong name")
-		return nil
-	}
+					// if err := (test*).WaitForResult(...) ?
+					if f, ok := c.Fun.(*ast.SelectorExpr); ok && f.Sel.Name == "WaitForResult" {
 
-	switch ff := c.Args[0].(type) {
-	case *ast.Ident:
-		return ff
-	case *ast.FuncLit:
-		return ff.Body
-	default:
-		log.Fatal("invalid WaitForResult arg type: %T", ff)
+						switch arg0 := c.Args[0].(type) {
+						// if err := (test*).WaitForResult(someFunc); ...
+						case *ast.Ident:
+							return arg0
+
+							// if err := (test*).WaitForResult(func() (bool, error) {...}); ...
+						case *ast.FuncLit:
+							return arg0.Body
+
+						default:
+							log.Fatal("invalid WaitForResult arg type: %T", arg0)
+						}
+					}
+				}
+			}
+		}
 	}
-	return nil
+	return n
 }
 
 // makeForRetry creates a for loop with a retryer
@@ -298,36 +255,68 @@ OUTER:
 // return false, val -> continue // do we have this?
 // return expr, val -> if expr { break } t.Log(val)
 func rewriteReturn(s *ast.ReturnStmt) (stmts []ast.Stmt) {
-	if vbool, ok := s.Results[0].(*ast.Ident); ok {
-		if vbool.Name == "true" {
+	// ast.Print(token.NewFileSet(), s.Results)
+	switch x := s.Results[0].(type) {
+	case *ast.Ident:
+		if x.Name == "true" {
 			return []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}
-		} else {
-			return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}
 		}
-	}
+		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}
 
-	if expr, ok := s.Results[0].(*ast.BinaryExpr); ok {
-		return []ast.Stmt{
+	case *ast.BinaryExpr, *ast.CallExpr:
+		stmts = []ast.Stmt{
 			&ast.IfStmt{
-				Cond: expr,
+				Cond: x,
 				Body: &ast.BlockStmt{
 					List: []ast.Stmt{
 						&ast.BranchStmt{Tok: token.BREAK},
 					},
 				},
 			},
-			&ast.ExprStmt{
-				X: &ast.CallExpr{
-					Fun: &ast.SelectorExpr{
-						X:   &ast.Ident{Name: "t"},
-						Sel: &ast.Ident{Name: "Log"},
-					},
-					Args: []ast.Expr{s.Results[1]},
-				},
-			},
 		}
+
+	default:
+		log.Fatalf("unsupported result type %T", s.Results[0])
 	}
-	panic("unsupported return")
+
+	var args []ast.Expr
+	switch x := s.Results[1].(type) {
+	case *ast.Ident:
+		if x.Name == "nil" {
+			return
+		}
+		args = []ast.Expr{x}
+
+	case *ast.BasicLit:
+		args = []ast.Expr{x}
+
+	case *ast.CallExpr:
+		fn := x.Fun.(*ast.SelectorExpr)
+		fname := fn.X.(*ast.Ident).Name + "." + fn.Sel.Name
+		if fname == "t.Fatalf" || fname == "fmt.Errorf" {
+			args = x.Args
+		} else {
+			args = []ast.Expr{x}
+		}
+
+	default:
+		log.Fatalf("unsupported result type %T", s.Results[1])
+	}
+
+	logf := "Logf"
+	if len(args) == 1 {
+		logf = "Log"
+	}
+	stmts = append(stmts, &ast.ExprStmt{
+		X: &ast.CallExpr{
+			Fun: &ast.SelectorExpr{
+				X:   &ast.Ident{Name: "t"},
+				Sel: &ast.Ident{Name: logf},
+			},
+			Args: args,
+		},
+	})
+	return
 }
 
 // rewrite if statements in the callback
@@ -336,21 +325,22 @@ func rewriteReturn(s *ast.ReturnStmt) (stmts []ast.Stmt) {
 // if cond { return false, fmt.Errorf(f) } -> if cond { t.Log(f); continue }
 // if cond { return false, val } -> if cond { t.Log(val); continue }
 func rewriteIf(s *ast.IfStmt) {
-	if len(s.Body.List) != 1 {
+	n := len(s.Body.List)
+	if n == 0 {
 		return
 	}
-	ret, ok := s.Body.List[0].(*ast.ReturnStmt)
+	ret, ok := s.Body.List[n-1].(*ast.ReturnStmt)
 	if !ok || len(ret.Results) != 2 {
 		return
 	}
 
 	// the error value
-	verr := ret.Results[1]
 
+	// fmt.Errorf(format) -> t.Log(format)
+	// fmt.Errorf(format, args) -> t.Logf(format, args)
 	logf := "Logf"
+	verr := ret.Results[1]
 	args := []ast.Expr{verr}
-
-	// simplify fmt.Errorf(format, args) to format, args
 	if ce, ok := verr.(*ast.CallExpr); ok {
 		if f, ok2 := ce.Fun.(*ast.SelectorExpr); ok2 {
 			if f.X.(*ast.Ident).Name == "fmt" && f.Sel.Name == "Errorf" {
@@ -358,7 +348,6 @@ func rewriteIf(s *ast.IfStmt) {
 			}
 		}
 	}
-
 	if len(args) == 1 {
 		logf = "Log"
 	}
@@ -375,6 +364,8 @@ func rewriteIf(s *ast.IfStmt) {
 		},
 	}
 
+	// return true, x -> break
+	// return false, x -> continue
 	vbool := ret.Results[0].(*ast.Ident).Name
 	if vbool == "false" {
 		stmts = append(stmts, &ast.BranchStmt{Tok: token.CONTINUE})

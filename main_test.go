@@ -91,6 +91,7 @@ func TestRewriteBody(t *testing.T) {
 		s = strings.Replace(s, "\n\n", "\n", -1) // replace newlines with ;
 		s = strings.Replace(s, "\n", ";", -1)    // replace newlines with ;
 		s = strings.Replace(s, "{;", "{ ", -1)
+		s = strings.Replace(s, ";}", " }", -1)
 		s = strings.Replace(s, "};", "} ", -1)
 		s = strings.Replace(s, ";;", ";", -1)
 		return s
