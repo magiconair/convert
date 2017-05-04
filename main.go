@@ -13,13 +13,11 @@
 //
 // to
 //
-//   for r := retry.OneSec(); r.NextOr(t.FailNow); {
+//   retry.Run("", t, func(r *retry.R) {
 //       if err := foo(); err != nil {
-//           t.Logf("foo: %s", err)
-//           continue
+//           t.Fatalf("foo: %s", err)
 //       }
-//       break
-//   }
+//   })
 //
 package main
 
@@ -105,7 +103,7 @@ func rewrite(c apply.ApplyCursor) bool {
 		default:
 			return true
 		}
-		c.Replace(makeForRetry(body))
+		c.Replace(makeRetryRun(body))
 	}
 	return true
 }
@@ -133,19 +131,17 @@ func makeSimpleBody(s *ast.Ident) *ast.BlockStmt {
 						&ast.ExprStmt{
 							&ast.CallExpr{
 								Fun: &ast.SelectorExpr{
-									X:   &ast.Ident{Name: "t"},
-									Sel: &ast.Ident{Name: "Log"},
+									X:   &ast.Ident{Name: "r"},
+									Sel: &ast.Ident{Name: "Fatal"},
 								},
 								Args: []ast.Expr{
 									&ast.Ident{Name: "err"},
 								},
 							},
 						},
-						&ast.BranchStmt{Tok: token.CONTINUE},
 					},
 				},
 			},
-			&ast.BranchStmt{Tok: token.BREAK},
 		},
 	}
 }
@@ -189,38 +185,36 @@ func wfrBody(n ast.Node) ast.Node {
 	return n
 }
 
-// makeForRetry creates a for loop with a retryer
-// which replaces the if stmt with testutil.WaitForResult.
-// It expects a body that is rewritten for the for loop.
-func makeForRetry(body *ast.BlockStmt) ast.Node {
-	return &ast.ForStmt{
-		Init: &ast.AssignStmt{
-			Lhs: []ast.Expr{
-				&ast.Ident{Name: "r"},
-			},
-			Tok: token.DEFINE,
-			Rhs: []ast.Expr{
-				&ast.CallExpr{
-					Fun: &ast.SelectorExpr{
-						X:   &ast.Ident{Name: "retry"},
-						Sel: &ast.Ident{Name: "OneSec"},
-					},
-				},
-			},
-		},
-		Cond: &ast.CallExpr{
+func makeRetryRun(body *ast.BlockStmt) ast.Node {
+	return &ast.ExprStmt{
+		X: &ast.CallExpr{
 			Fun: &ast.SelectorExpr{
-				X:   &ast.Ident{Name: "r"},
-				Sel: &ast.Ident{Name: "NextOr"},
+				X:   &ast.Ident{Name: "retry"},
+				Sel: &ast.Ident{Name: "Run"},
 			},
 			Args: []ast.Expr{
-				&ast.SelectorExpr{
-					X:   &ast.Ident{Name: "t"},
-					Sel: &ast.Ident{Name: "FailNow"},
+				&ast.BasicLit{Kind: token.STRING, Value: `""`},
+				&ast.Ident{Name: "t"},
+				&ast.FuncLit{
+					Type: &ast.FuncType{
+						Params: &ast.FieldList{
+							List: []*ast.Field{
+								&ast.Field{
+									Names: []*ast.Ident{
+										&ast.Ident{Name: "r"},
+									},
+									Type: &ast.SelectorExpr{
+										X:   &ast.Ident{Name: "*retry"},
+										Sel: &ast.Ident{Name: "R"},
+									},
+								},
+							},
+						},
+					},
+					Body: body,
 				},
 			},
 		},
-		Body: body,
 	}
 }
 
@@ -251,25 +245,81 @@ OUTER:
 
 // rewrite return statements
 //
-// return true, val -> break
+// return true, val -> drop
 // return false, val -> continue // do we have this?
-// return expr, val -> if expr { break } t.Log(val)
+// return expr, val -> if !expr { r.Fatal(val) }
 func rewriteReturn(s *ast.ReturnStmt) (stmts []ast.Stmt) {
+	// define negations of operations
+	notOp := map[token.Token]token.Token{
+		token.EQL: token.NEQ, // ! == => !=
+		token.GTR: token.LEQ, // ! > => <=
+		token.GEQ: token.LSS, // ! >= => <
+	}
+	// auto-generate the inverse operations
+	for k, v := range notOp {
+		notOp[v] = k
+	}
+
 	// ast.Print(token.NewFileSet(), s.Results)
 	switch x := s.Results[0].(type) {
 	case *ast.Ident:
 		if x.Name == "true" {
-			return []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}
+			return []ast.Stmt{}
 		}
-		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}
 
 	case *ast.BinaryExpr, *ast.CallExpr:
-		stmts = []ast.Stmt{
+		var args []ast.Expr
+		switch x := s.Results[1].(type) {
+		case *ast.Ident:
+			args = []ast.Expr{x}
+
+		case *ast.BasicLit:
+			args = []ast.Expr{x}
+
+		case *ast.CallExpr:
+			fn := x.Fun.(*ast.SelectorExpr)
+			fname := fn.X.(*ast.Ident).Name + "." + fn.Sel.Name
+			if fname == "t.Fatalf" || fname == "fmt.Errorf" {
+				args = x.Args
+			} else {
+				args = []ast.Expr{x}
+			}
+
+		default:
+			log.Fatalf("unsupported result type %T", s.Results[1])
+		}
+
+		var cond ast.Expr
+		if be, ok := x.(*ast.BinaryExpr); ok {
+			invop, ok2 := notOp[be.Op]
+			if !ok2 {
+				log.Fatal("no negation for token ", be.Op)
+			}
+			be.Op = invop
+			cond = be
+		} else {
+			cond = &ast.UnaryExpr{Op: token.NOT, X: x}
+		}
+
+		logf := "Fatalf"
+		if len(args) == 1 {
+			logf = "Fatal"
+		}
+
+		return []ast.Stmt{
 			&ast.IfStmt{
-				Cond: x,
+				Cond: cond,
 				Body: &ast.BlockStmt{
 					List: []ast.Stmt{
-						&ast.BranchStmt{Tok: token.BREAK},
+						&ast.ExprStmt{
+							X: &ast.CallExpr{
+								Fun: &ast.SelectorExpr{
+									X:   &ast.Ident{Name: "r"},
+									Sel: &ast.Ident{Name: logf},
+								},
+								Args: args,
+							},
+						},
 					},
 				},
 			},
@@ -278,100 +328,68 @@ func rewriteReturn(s *ast.ReturnStmt) (stmts []ast.Stmt) {
 	default:
 		log.Fatalf("unsupported result type %T", s.Results[0])
 	}
-
-	var args []ast.Expr
-	switch x := s.Results[1].(type) {
-	case *ast.Ident:
-		if x.Name == "nil" {
-			return
-		}
-		args = []ast.Expr{x}
-
-	case *ast.BasicLit:
-		args = []ast.Expr{x}
-
-	case *ast.CallExpr:
-		fn := x.Fun.(*ast.SelectorExpr)
-		fname := fn.X.(*ast.Ident).Name + "." + fn.Sel.Name
-		if fname == "t.Fatalf" || fname == "fmt.Errorf" {
-			args = x.Args
-		} else {
-			args = []ast.Expr{x}
-		}
-
-	default:
-		log.Fatalf("unsupported result type %T", s.Results[1])
-	}
-
-	logf := "Logf"
-	if len(args) == 1 {
-		logf = "Log"
-	}
-	stmts = append(stmts, &ast.ExprStmt{
-		X: &ast.CallExpr{
-			Fun: &ast.SelectorExpr{
-				X:   &ast.Ident{Name: "t"},
-				Sel: &ast.Ident{Name: logf},
-			},
-			Args: args,
-		},
-	})
 	return
 }
 
 // rewrite if statements in the callback
 //
-// if cond { return false, fmt.Errorf(f, a) } -> if cond { t.Logf(f, a); continue }
-// if cond { return false, fmt.Errorf(f) } -> if cond { t.Log(f); continue }
-// if cond { return false, val } -> if cond { t.Log(val); continue }
+// if cond { return false, fmt.Errorf(f, a) } -> if cond { retry.Fatalf(f, a) }
+// if cond { return false, fmt.Errorf(f) } -> if cond { retry.Fatal(f) }
+// if cond { return false, val } -> if cond { retry.Fatal(val) }
+// if cond { t.Fatal(err) } -> if cond { r.Fatal(err) }
 func rewriteIf(s *ast.IfStmt) {
+	// ast.Print(token.NewFileSet(), s)
 	n := len(s.Body.List)
 	if n == 0 {
 		return
 	}
-	ret, ok := s.Body.List[n-1].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) != 2 {
-		return
+	last := s.Body.List[n-1]
+	switch x := last.(type) {
+	case *ast.ExprStmt:
+		c, ok := x.X.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		// hack: swap t.(Fatal|Fatalf) -> r.(Fatal|Fatalf)
+		fn := c.Fun.(*ast.SelectorExpr)
+		if fn.X.(*ast.Ident).Name == "t" {
+			fn.X.(*ast.Ident).Name = "r"
+		}
+	case *ast.ReturnStmt:
+		// return (true|false), x ?
+		if len(x.Results) != 2 {
+			return
+		}
+
+		// fmt.Errorf(format) -> r.Fatal(format)
+		// fmt.Errorf(format, args) -> r.Fatalf(format, args)
+		logf := "Fatalf"
+		verr := x.Results[1]
+		args := []ast.Expr{verr}
+		if ce, ok := verr.(*ast.CallExpr); ok {
+			if f, ok2 := ce.Fun.(*ast.SelectorExpr); ok2 {
+				if f.X.(*ast.Ident).Name == "fmt" && f.Sel.Name == "Errorf" {
+					args = ce.Args
+				}
+			}
+		}
+		if len(args) == 1 {
+			logf = "Fatal"
+		}
+
+		s.Body.List = []ast.Stmt{
+			&ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.SelectorExpr{
+						X:   &ast.Ident{Name: "r"},
+						Sel: &ast.Ident{Name: logf},
+					},
+					Args: args,
+				},
+			},
+		}
 	}
 
 	// the error value
 
-	// fmt.Errorf(format) -> t.Log(format)
-	// fmt.Errorf(format, args) -> t.Logf(format, args)
-	logf := "Logf"
-	verr := ret.Results[1]
-	args := []ast.Expr{verr}
-	if ce, ok := verr.(*ast.CallExpr); ok {
-		if f, ok2 := ce.Fun.(*ast.SelectorExpr); ok2 {
-			if f.X.(*ast.Ident).Name == "fmt" && f.Sel.Name == "Errorf" {
-				args = ce.Args
-			}
-		}
-	}
-	if len(args) == 1 {
-		logf = "Log"
-	}
-
-	stmts := []ast.Stmt{
-		&ast.ExprStmt{
-			X: &ast.CallExpr{
-				Fun: &ast.SelectorExpr{
-					X:   &ast.Ident{Name: "t"},
-					Sel: &ast.Ident{Name: logf},
-				},
-				Args: args,
-			},
-		},
-	}
-
-	// return true, x -> break
-	// return false, x -> continue
-	vbool := ret.Results[0].(*ast.Ident).Name
-	if vbool == "false" {
-		stmts = append(stmts, &ast.BranchStmt{Tok: token.CONTINUE})
-	} else {
-		stmts = append(stmts, &ast.BranchStmt{Tok: token.BREAK})
-	}
-
-	s.Body.List = stmts
 }

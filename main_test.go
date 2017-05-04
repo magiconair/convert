@@ -20,9 +20,7 @@ func TestRewriteBody(t *testing.T) {
 			}
 			`,
 			`
-			for r := retry.OneSec(); r.NextOr(t.FailNow); {
-				break
-			}
+			retry.Run("", t, func(r *retry.R) { })
 			`,
 		},
 		{
@@ -38,12 +36,11 @@ func TestRewriteBody(t *testing.T) {
 			}
 			`,
 			`
-			for r := retry.OneSec(); r.NextOr(t.FailNow); {
+			retry.Run("", t, func(r *retry.R) {
 				if foo == bar {
-					t.Fatal(err)
+					r.Fatal(err)
 				}
-				break
-			}
+			})
 			`,
 		},
 		{
@@ -56,12 +53,28 @@ func TestRewriteBody(t *testing.T) {
 			}
 			`,
 			`
-			for r := retry.OneSec(); r.NextOr(t.FailNow); {
-				if x > 0 {
-					break
+			retry.Run("", t, func(r *retry.R) {
+				if x <= 0 {
+					r.Fatal("foo")
 				}
-				t.Log("foo")
+			})
+			`,
+		},
+		{
+			"return with binary expr and func",
+			`
+			if err := testutil.WaitForResult(func() (bool, error) {
+				return len(s1.WANMembers()) > 1, nil
+			}); err != nil {
+				t.Fatal(err)
 			}
+			`,
+			`
+			retry.Run("", t, func(r *retry.R) {
+				if len(s1.WANMembers()) <= 1 {
+					r.Fatal(nil)
+				}
+			})
 			`,
 		},
 		{
@@ -74,13 +87,11 @@ func TestRewriteBody(t *testing.T) {
 			`,
 			`
 			g := func() (bool, error) { return true, nil }
-			for r := retry.OneSec(); r.NextOr(t.FailNow); {
+			retry.Run("", t, func(r *retry.R) {
 				if err := g(); err != nil {
-					t.Log(err)
-					continue
+					r.Fatal(err)
 				}
-				break
-			}
+			})
 			`,
 		},
 	}
